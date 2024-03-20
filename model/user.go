@@ -3,8 +3,12 @@ package model
 import (
 	"errors"
 	"fmt"
+	"github.com/songquanpeng/one-api/common"
+	"github.com/songquanpeng/one-api/common/blacklist"
+	"github.com/songquanpeng/one-api/common/config"
+	"github.com/songquanpeng/one-api/common/helper"
+	"github.com/songquanpeng/one-api/common/logger"
 	"gorm.io/gorm"
-	"one-api/common"
 	"strings"
 )
 
@@ -15,16 +19,16 @@ type User struct {
 	Username         string `json:"username" gorm:"unique;index" validate:"max=12"`
 	Password         string `json:"password" gorm:"not null;" validate:"min=8,max=20"`
 	DisplayName      string `json:"display_name" gorm:"index" validate:"max=20"`
-	Role             int    `json:"role" gorm:"type:int;default:1"`   // admin, common
+	Role             int    `json:"role" gorm:"type:int;default:1"`   // admin, util
 	Status           int    `json:"status" gorm:"type:int;default:1"` // enabled, disabled
 	Email            string `json:"email" gorm:"index" validate:"max=50"`
 	GitHubId         string `json:"github_id" gorm:"column:github_id;index"`
 	WeChatId         string `json:"wechat_id" gorm:"column:wechat_id;index"`
 	VerificationCode string `json:"verification_code" gorm:"-:all"`                                    // this field is only for Email verification, don't save it to database!
 	AccessToken      string `json:"access_token" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
-	Quota            int    `json:"quota" gorm:"type:int;default:0"`
-	UsedQuota        int    `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
-	RequestCount     int    `json:"request_count" gorm:"type:int;default:0;"`               // request number
+	Quota            int64  `json:"quota" gorm:"bigint;default:0"`
+	UsedQuota        int64  `json:"used_quota" gorm:"bigint;default:0;column:used_quota"` // used quota
+	RequestCount     int    `json:"request_count" gorm:"type:int;default:0;"`             // request number
 	Group            string `json:"group" gorm:"type:varchar(32);default:'default'"`
 	AffCode          string `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
 	InviterId        int    `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
@@ -36,13 +40,30 @@ func GetMaxUserId() int {
 	return user.Id
 }
 
-func GetAllUsers(startIdx int, num int) (users []*User, err error) {
-	err = DB.Order("id desc").Limit(num).Offset(startIdx).Omit("password").Find(&users).Error
-	return users, err
+func GetAllUsers(startIdx int, num int, order string) (users []*User, err error) {
+    query := DB.Limit(num).Offset(startIdx).Omit("password").Where("status != ?", common.UserStatusDeleted)
+    
+    switch order {
+    case "quota":
+        query = query.Order("quota desc")
+    case "used_quota":
+        query = query.Order("used_quota desc")
+    case "request_count":
+        query = query.Order("request_count desc")
+    default:
+        query = query.Order("id desc")
+    }
+    
+    err = query.Find(&users).Error
+    return users, err
 }
 
 func SearchUsers(keyword string) (users []*User, err error) {
-	err = DB.Omit("password").Where("id = ? or username LIKE ? or email LIKE ? or display_name LIKE ?", keyword, keyword+"%", keyword+"%", keyword+"%").Find(&users).Error
+	if !common.UsingPostgreSQL {
+		err = DB.Omit("password").Where("id = ? or username LIKE ? or email LIKE ? or display_name LIKE ?", keyword, keyword+"%", keyword+"%", keyword+"%").Find(&users).Error
+	} else {
+		err = DB.Omit("password").Where("username LIKE ? or email LIKE ? or display_name LIKE ?", keyword+"%", keyword+"%", keyword+"%").Find(&users).Error
+	}
 	return users, err
 }
 
@@ -85,24 +106,24 @@ func (user *User) Insert(inviterId int) error {
 			return err
 		}
 	}
-	user.Quota = common.QuotaForNewUser
-	user.AccessToken = common.GetUUID()
-	user.AffCode = common.GetRandomString(4)
+	user.Quota = config.QuotaForNewUser
+	user.AccessToken = helper.GetUUID()
+	user.AffCode = helper.GetRandomString(4)
 	result := DB.Create(user)
 	if result.Error != nil {
 		return result.Error
 	}
-	if common.QuotaForNewUser > 0 {
-		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", common.LogQuota(common.QuotaForNewUser)))
+	if config.QuotaForNewUser > 0 {
+		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", common.LogQuota(config.QuotaForNewUser)))
 	}
 	if inviterId != 0 {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee)
-			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", common.LogQuota(common.QuotaForInvitee)))
+		if config.QuotaForInvitee > 0 {
+			_ = IncreaseUserQuota(user.Id, config.QuotaForInvitee)
+			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", common.LogQuota(config.QuotaForInvitee)))
 		}
-		if common.QuotaForInviter > 0 {
-			_ = IncreaseUserQuota(inviterId, common.QuotaForInviter)
-			RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", common.LogQuota(common.QuotaForInviter)))
+		if config.QuotaForInviter > 0 {
+			_ = IncreaseUserQuota(inviterId, config.QuotaForInviter)
+			RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", common.LogQuota(config.QuotaForInviter)))
 		}
 	}
 	return nil
@@ -116,6 +137,11 @@ func (user *User) Update(updatePassword bool) error {
 			return err
 		}
 	}
+	if user.Status == common.UserStatusDisabled {
+		blacklist.BanUser(user.Id)
+	} else if user.Status == common.UserStatusEnabled {
+		blacklist.UnbanUser(user.Id)
+	}
 	err = DB.Model(user).Updates(user).Error
 	return err
 }
@@ -124,7 +150,10 @@ func (user *User) Delete() error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
-	err := DB.Delete(user).Error
+	blacklist.BanUser(user.Id)
+	user.Username = fmt.Sprintf("deleted_%s", helper.GetUUID())
+	user.Status = common.UserStatusDeleted
+	err := DB.Model(user).Updates(user).Error
 	return err
 }
 
@@ -137,7 +166,15 @@ func (user *User) ValidateAndFill() (err error) {
 	if user.Username == "" || password == "" {
 		return errors.New("用户名或密码为空")
 	}
-	DB.Where(User{Username: user.Username}).First(user)
+	err = DB.Where("username = ?", user.Username).First(user).Error
+	if err != nil {
+		// we must make sure check username firstly
+		// consider this case: a malicious user set his username as other's email
+		err := DB.Where("email = ?", user.Username).First(user).Error
+		if err != nil {
+			return errors.New("用户名或密码错误，或用户已被封禁")
+		}
+	}
 	okay := common.ValidatePasswordAndHash(password, user.Password)
 	if !okay || user.Status != common.UserStatusEnabled {
 		return errors.New("用户名或密码错误，或用户已被封禁")
@@ -220,23 +257,22 @@ func IsAdmin(userId int) bool {
 	var user User
 	err := DB.Where("id = ?", userId).Select("role").Find(&user).Error
 	if err != nil {
-		common.SysError("no such user " + err.Error())
+		logger.SysError("no such user " + err.Error())
 		return false
 	}
 	return user.Role >= common.RoleAdminUser
 }
 
-func IsUserEnabled(userId int) bool {
+func IsUserEnabled(userId int) (bool, error) {
 	if userId == 0 {
-		return false
+		return false, errors.New("user id is empty")
 	}
 	var user User
 	err := DB.Where("id = ?", userId).Select("status").Find(&user).Error
 	if err != nil {
-		common.SysError("no such user " + err.Error())
-		return false
+		return false, err
 	}
-	return user.Status == common.UserStatusEnabled
+	return user.Status == common.UserStatusEnabled, nil
 }
 
 func ValidateAccessToken(token string) (user *User) {
@@ -251,12 +287,12 @@ func ValidateAccessToken(token string) (user *User) {
 	return nil
 }
 
-func GetUserQuota(id int) (quota int, err error) {
+func GetUserQuota(id int) (quota int64, err error) {
 	err = DB.Model(&User{}).Where("id = ?", id).Select("quota").Find(&quota).Error
 	return quota, err
 }
 
-func GetUserUsedQuota(id int) (quota int, err error) {
+func GetUserUsedQuota(id int) (quota int64, err error) {
 	err = DB.Model(&User{}).Where("id = ?", id).Select("used_quota").Find(&quota).Error
 	return quota, err
 }
@@ -267,22 +303,43 @@ func GetUserEmail(id int) (email string, err error) {
 }
 
 func GetUserGroup(id int) (group string, err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Select("`group`").Find(&group).Error
+	groupCol := "`group`"
+	if common.UsingPostgreSQL {
+		groupCol = `"group"`
+	}
+
+	err = DB.Model(&User{}).Where("id = ?", id).Select(groupCol).Find(&group).Error
 	return group, err
 }
 
-func IncreaseUserQuota(id int, quota int) (err error) {
+func IncreaseUserQuota(id int, quota int64) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if config.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
+		return nil
+	}
+	return increaseUserQuota(id, quota)
+}
+
+func increaseUserQuota(id int, quota int64) (err error) {
 	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", quota)).Error
 	return err
 }
 
-func DecreaseUserQuota(id int, quota int) (err error) {
+func DecreaseUserQuota(id int, quota int64) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if config.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
+		return nil
+	}
+	return decreaseUserQuota(id, quota)
+}
+
+func decreaseUserQuota(id int, quota int64) (err error) {
 	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
 	return err
 }
@@ -292,15 +349,42 @@ func GetRootUserEmail() (email string) {
 	return email
 }
 
-func UpdateUserUsedQuotaAndRequestCount(id int, quota int) {
+func UpdateUserUsedQuotaAndRequestCount(id int, quota int64) {
+	if config.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUsedQuota, id, quota)
+		addNewRecord(BatchUpdateTypeRequestCount, id, 1)
+		return
+	}
+	updateUserUsedQuotaAndRequestCount(id, quota, 1)
+}
+
+func updateUserUsedQuotaAndRequestCount(id int, quota int64, count int) {
 	err := DB.Model(&User{}).Where("id = ?", id).Updates(
 		map[string]interface{}{
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
-			"request_count": gorm.Expr("request_count + ?", 1),
+			"request_count": gorm.Expr("request_count + ?", count),
 		},
 	).Error
 	if err != nil {
-		common.SysError("failed to update user used quota and request count: " + err.Error())
+		logger.SysError("failed to update user used quota and request count: " + err.Error())
+	}
+}
+
+func updateUserUsedQuota(id int, quota int64) {
+	err := DB.Model(&User{}).Where("id = ?", id).Updates(
+		map[string]interface{}{
+			"used_quota": gorm.Expr("used_quota + ?", quota),
+		},
+	).Error
+	if err != nil {
+		logger.SysError("failed to update user used quota: " + err.Error())
+	}
+}
+
+func updateUserRequestCount(id int, count int) {
+	err := DB.Model(&User{}).Where("id = ?", id).Update("request_count", gorm.Expr("request_count + ?", count)).Error
+	if err != nil {
+		logger.SysError("failed to update user request count: " + err.Error())
 	}
 }
 

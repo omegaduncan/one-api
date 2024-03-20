@@ -3,8 +3,9 @@ package model
 import (
 	"errors"
 	"fmt"
+	"github.com/songquanpeng/one-api/common"
+	"github.com/songquanpeng/one-api/common/helper"
 	"gorm.io/gorm"
-	"one-api/common"
 )
 
 type Redemption struct {
@@ -13,7 +14,7 @@ type Redemption struct {
 	Key          string `json:"key" gorm:"type:char(32);uniqueIndex"`
 	Status       int    `json:"status" gorm:"default:1"`
 	Name         string `json:"name" gorm:"index"`
-	Quota        int    `json:"quota" gorm:"default:100"`
+	Quota        int64  `json:"quota" gorm:"bigint;default:100"`
 	CreatedTime  int64  `json:"created_time" gorm:"bigint"`
 	RedeemedTime int64  `json:"redeemed_time" gorm:"bigint"`
 	Count        int    `json:"count" gorm:"-:all"` // only for api request
@@ -41,7 +42,7 @@ func GetRedemptionById(id int) (*Redemption, error) {
 	return &redemption, err
 }
 
-func Redeem(key string, userId int) (quota int, err error) {
+func Redeem(key string, userId int) (quota int64, err error) {
 	if key == "" {
 		return 0, errors.New("未提供兑换码")
 	}
@@ -50,8 +51,13 @@ func Redeem(key string, userId int) (quota int, err error) {
 	}
 	redemption := &Redemption{}
 
+	keyCol := "`key`"
+	if common.UsingPostgreSQL {
+		keyCol = `"key"`
+	}
+
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := tx.Set("gorm:query_option", "FOR UPDATE").Where("`key` = ?", key).First(redemption).Error
+		err := tx.Set("gorm:query_option", "FOR UPDATE").Where(keyCol+" = ?", key).First(redemption).Error
 		if err != nil {
 			return errors.New("无效的兑换码")
 		}
@@ -62,7 +68,7 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if err != nil {
 			return err
 		}
-		redemption.RedeemedTime = common.GetTimestamp()
+		redemption.RedeemedTime = helper.GetTimestamp()
 		redemption.Status = common.RedemptionCodeStatusUsed
 		err = tx.Save(redemption).Error
 		return err

@@ -2,9 +2,10 @@ package middleware
 
 import (
 	"fmt"
+	"github.com/songquanpeng/one-api/common"
+	"github.com/songquanpeng/one-api/common/logger"
+	"github.com/songquanpeng/one-api/model"
 	"net/http"
-	"one-api/common"
-	"one-api/model"
 	"strconv"
 	"strings"
 
@@ -20,39 +21,22 @@ func Distribute() func(c *gin.Context) {
 		userId := c.GetInt("id")
 		userGroup, _ := model.CacheGetUserGroup(userId)
 		c.Set("group", userGroup)
+		var requestModel string
 		var channel *model.Channel
-		channelId, ok := c.Get("channelId")
+		channelId, ok := c.Get("specific_channel_id")
 		if ok {
 			id, err := strconv.Atoi(channelId.(string))
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"error": gin.H{
-						"message": "无效的渠道 ID",
-						"type":    "one_api_error",
-					},
-				})
-				c.Abort()
+				abortWithMessage(c, http.StatusBadRequest, "无效的渠道 Id")
 				return
 			}
 			channel, err = model.GetChannelById(id, true)
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"error": gin.H{
-						"message": "无效的渠道 ID",
-						"type":    "one_api_error",
-					},
-				})
-				c.Abort()
+				abortWithMessage(c, http.StatusBadRequest, "无效的渠道 Id")
 				return
 			}
 			if channel.Status != common.ChannelStatusEnabled {
-				c.JSON(http.StatusForbidden, gin.H{
-					"error": gin.H{
-						"message": "该渠道已被禁用",
-						"type":    "one_api_error",
-					},
-				})
-				c.Abort()
+				abortWithMessage(c, http.StatusForbidden, "该渠道已被禁用")
 				return
 			}
 		} else {
@@ -60,13 +44,7 @@ func Distribute() func(c *gin.Context) {
 			var modelRequest ModelRequest
 			err := common.UnmarshalBodyReusable(c, &modelRequest)
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"error": gin.H{
-						"message": "无效的请求",
-						"type":    "one_api_error",
-					},
-				})
-				c.Abort()
+				abortWithMessage(c, http.StatusBadRequest, "无效的请求")
 				return
 			}
 			if strings.HasPrefix(c.Request.URL.Path, "/v1/moderations") {
@@ -81,35 +59,54 @@ func Distribute() func(c *gin.Context) {
 			}
 			if strings.HasPrefix(c.Request.URL.Path, "/v1/images/generations") {
 				if modelRequest.Model == "" {
-					modelRequest.Model = "dall-e"
+					modelRequest.Model = "dall-e-2"
 				}
 			}
-			channel, err = model.CacheGetRandomSatisfiedChannel(userGroup, modelRequest.Model)
+			if strings.HasPrefix(c.Request.URL.Path, "/v1/audio/transcriptions") || strings.HasPrefix(c.Request.URL.Path, "/v1/audio/translations") {
+				if modelRequest.Model == "" {
+					modelRequest.Model = "whisper-1"
+				}
+			}
+			requestModel = modelRequest.Model
+			channel, err = model.CacheGetRandomSatisfiedChannel(userGroup, modelRequest.Model, false)
 			if err != nil {
 				message := fmt.Sprintf("当前分组 %s 下对于模型 %s 无可用渠道", userGroup, modelRequest.Model)
 				if channel != nil {
-					common.SysError(fmt.Sprintf("渠道不存在：%d", channel.Id))
+					logger.SysError(fmt.Sprintf("渠道不存在：%d", channel.Id))
 					message = "数据库一致性已被破坏，请联系管理员"
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{
-						"message": message,
-						"type":    "one_api_error",
-					},
-				})
-				c.Abort()
+				abortWithMessage(c, http.StatusServiceUnavailable, message)
 				return
 			}
 		}
-		c.Set("channel", channel.Type)
-		c.Set("channel_id", channel.Id)
-		c.Set("channel_name", channel.Name)
-		c.Set("model_mapping", channel.ModelMapping)
-		c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", channel.Key))
-		c.Set("base_url", channel.BaseURL)
-		if channel.Type == common.ChannelTypeAzure {
-			c.Set("api_version", channel.Other)
-		}
+		SetupContextForSelectedChannel(c, channel, requestModel)
 		c.Next()
+	}
+}
+
+func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) {
+	c.Set("channel", channel.Type)
+	c.Set("channel_id", channel.Id)
+	c.Set("channel_name", channel.Name)
+	c.Set("model_mapping", channel.GetModelMapping())
+	c.Set("original_model", modelName) // for retry
+	c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", channel.Key))
+	c.Set("base_url", channel.GetBaseURL())
+	// this is for backward compatibility
+	switch channel.Type {
+	case common.ChannelTypeAzure:
+		c.Set(common.ConfigKeyAPIVersion, channel.Other)
+	case common.ChannelTypeXunfei:
+		c.Set(common.ConfigKeyAPIVersion, channel.Other)
+	case common.ChannelTypeGemini:
+		c.Set(common.ConfigKeyAPIVersion, channel.Other)
+	case common.ChannelTypeAIProxyLibrary:
+		c.Set(common.ConfigKeyLibraryID, channel.Other)
+	case common.ChannelTypeAli:
+		c.Set(common.ConfigKeyPlugin, channel.Other)
+	}
+	cfg, _ := channel.LoadConfig()
+	for k, v := range cfg {
+		c.Set(common.ConfigKeyPrefix+k, v)
 	}
 }

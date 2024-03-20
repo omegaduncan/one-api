@@ -5,83 +5,107 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
+	"github.com/songquanpeng/one-api/common"
+	"github.com/songquanpeng/one-api/common/config"
+	"github.com/songquanpeng/one-api/common/logger"
+	"github.com/songquanpeng/one-api/common/message"
+	"github.com/songquanpeng/one-api/middleware"
+	"github.com/songquanpeng/one-api/model"
+	"github.com/songquanpeng/one-api/monitor"
+	"github.com/songquanpeng/one-api/relay/constant"
+	"github.com/songquanpeng/one-api/relay/helper"
+	relaymodel "github.com/songquanpeng/one-api/relay/model"
+	"github.com/songquanpeng/one-api/relay/util"
+	"io"
 	"net/http"
-	"one-api/common"
-	"one-api/model"
+	"net/http/httptest"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
-func testChannel(channel *model.Channel, request ChatRequest) (error, *OpenAIError) {
-	switch channel.Type {
-	case common.ChannelTypePaLM:
-		fallthrough
-	case common.ChannelTypeAnthropic:
-		fallthrough
-	case common.ChannelTypeBaidu:
-		fallthrough
-	case common.ChannelTypeZhipu:
-		fallthrough
-	case common.ChannelTypeXunfei:
-		return errors.New("该渠道类型当前版本不支持测试，请手动测试"), nil
-	case common.ChannelTypeAzure:
-		request.Model = "gpt-35-turbo"
-	default:
-		request.Model = "gpt-3.5-turbo"
+func buildTestRequest() *relaymodel.GeneralOpenAIRequest {
+	testRequest := &relaymodel.GeneralOpenAIRequest{
+		MaxTokens: 2,
+		Stream:    false,
+		Model:     "gpt-3.5-turbo",
 	}
-	requestURL := common.ChannelBaseURLs[channel.Type]
-	if channel.Type == common.ChannelTypeAzure {
-		requestURL = fmt.Sprintf("%s/openai/deployments/%s/chat/completions?api-version=2023-03-15-preview", channel.BaseURL, request.Model)
-	} else {
-		if channel.BaseURL != "" {
-			requestURL = channel.BaseURL
-		}
-		requestURL += "/v1/chat/completions"
-	}
-
-	jsonData, err := json.Marshal(request)
-	if err != nil {
-		return err, nil
-	}
-	req, err := http.NewRequest("POST", requestURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err, nil
-	}
-	if channel.Type == common.ChannelTypeAzure {
-		req.Header.Set("api-key", channel.Key)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+channel.Key)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err, nil
-	}
-	defer resp.Body.Close()
-	var response TextResponse
-	err = json.NewDecoder(resp.Body).Decode(&response)
-	if err != nil {
-		return err, nil
-	}
-	if response.Usage.CompletionTokens == 0 {
-		return errors.New(fmt.Sprintf("type %s, code %v, message %s", response.Error.Type, response.Error.Code, response.Error.Message)), &response.Error
-	}
-	return nil, nil
-}
-
-func buildTestRequest() *ChatRequest {
-	testRequest := &ChatRequest{
-		Model:     "", // this will be set later
-		MaxTokens: 1,
-	}
-	testMessage := Message{
+	testMessage := relaymodel.Message{
 		Role:    "user",
 		Content: "hi",
 	}
 	testRequest.Messages = append(testRequest.Messages, testMessage)
 	return testRequest
+}
+
+func testChannel(channel *model.Channel) (err error, openaiErr *relaymodel.Error) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = &http.Request{
+		Method: "POST",
+		URL:    &url.URL{Path: "/v1/chat/completions"},
+		Body:   nil,
+		Header: make(http.Header),
+	}
+	c.Request.Header.Set("Authorization", "Bearer "+channel.Key)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("channel", channel.Type)
+	c.Set("base_url", channel.GetBaseURL())
+	middleware.SetupContextForSelectedChannel(c, channel, "")
+	meta := util.GetRelayMeta(c)
+	apiType := constant.ChannelType2APIType(channel.Type)
+	adaptor := helper.GetAdaptor(apiType)
+	if adaptor == nil {
+		return fmt.Errorf("invalid api type: %d, adaptor is nil", apiType), nil
+	}
+	adaptor.Init(meta)
+	modelName := adaptor.GetModelList()[0]
+	if !strings.Contains(channel.Models, modelName) {
+		modelNames := strings.Split(channel.Models, ",")
+		if len(modelNames) > 0 {
+			modelName = modelNames[0]
+		}
+	}
+	request := buildTestRequest()
+	request.Model = modelName
+	meta.OriginModelName, meta.ActualModelName = modelName, modelName
+	convertedRequest, err := adaptor.ConvertRequest(c, constant.RelayModeChatCompletions, request)
+	if err != nil {
+		return err, nil
+	}
+	jsonData, err := json.Marshal(convertedRequest)
+	if err != nil {
+		return err, nil
+	}
+	requestBody := bytes.NewBuffer(jsonData)
+	c.Request.Body = io.NopCloser(requestBody)
+	resp, err := adaptor.DoRequest(c, meta, requestBody)
+	if err != nil {
+		return err, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		err := util.RelayErrorHandler(resp)
+		return fmt.Errorf("status code %d: %s", resp.StatusCode, err.Error.Message), &err.Error
+	}
+	usage, respErr := adaptor.DoResponse(c, resp, meta)
+	if respErr != nil {
+		return fmt.Errorf("%s", respErr.Error.Message), &respErr.Error
+	}
+	if usage == nil {
+		return errors.New("usage is nil"), nil
+	}
+	result := w.Result()
+	// print result.Body
+	respBody, err := io.ReadAll(result.Body)
+	if err != nil {
+		return err, nil
+	}
+	logger.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	return nil, nil
 }
 
 func TestChannel(c *gin.Context) {
@@ -101,9 +125,8 @@ func TestChannel(c *gin.Context) {
 		})
 		return
 	}
-	testRequest := buildTestRequest()
 	tik := time.Now()
-	err, _ = testChannel(channel, *testRequest)
+	err, _ = testChannel(channel)
 	tok := time.Now()
 	milliseconds := tok.Sub(tik).Milliseconds()
 	go channel.UpdateResponseTime(milliseconds)
@@ -127,23 +150,9 @@ func TestChannel(c *gin.Context) {
 var testAllChannelsLock sync.Mutex
 var testAllChannelsRunning bool = false
 
-// disable & notify
-func disableChannel(channelId int, channelName string, reason string) {
-	if common.RootUserEmail == "" {
-		common.RootUserEmail = model.GetRootUserEmail()
-	}
-	model.UpdateChannelStatusById(channelId, common.ChannelStatusDisabled)
-	subject := fmt.Sprintf("通道「%s」（#%d）已被禁用", channelName, channelId)
-	content := fmt.Sprintf("通道「%s」（#%d）已被禁用，原因：%s", channelName, channelId, reason)
-	err := common.SendEmail(subject, common.RootUserEmail, content)
-	if err != nil {
-		common.SysError(fmt.Sprintf("failed to send email: %s", err.Error()))
-	}
-}
-
-func testAllChannels(notify bool) error {
-	if common.RootUserEmail == "" {
-		common.RootUserEmail = model.GetRootUserEmail()
+func testChannels(notify bool, scope string) error {
+	if config.RootUserEmail == "" {
+		config.RootUserEmail = model.GetRootUserEmail()
 	}
 	testAllChannelsLock.Lock()
 	if testAllChannelsRunning {
@@ -152,49 +161,57 @@ func testAllChannels(notify bool) error {
 	}
 	testAllChannelsRunning = true
 	testAllChannelsLock.Unlock()
-	channels, err := model.GetAllChannels(0, 0, true)
+	channels, err := model.GetAllChannels(0, 0, scope)
 	if err != nil {
 		return err
 	}
-	testRequest := buildTestRequest()
-	var disableThreshold = int64(common.ChannelDisableThreshold * 1000)
+	var disableThreshold = int64(config.ChannelDisableThreshold * 1000)
 	if disableThreshold == 0 {
 		disableThreshold = 10000000 // a impossible value
 	}
 	go func() {
 		for _, channel := range channels {
-			if channel.Status != common.ChannelStatusEnabled {
-				continue
-			}
+			isChannelEnabled := channel.Status == common.ChannelStatusEnabled
 			tik := time.Now()
-			err, openaiErr := testChannel(channel, *testRequest)
+			err, openaiErr := testChannel(channel)
 			tok := time.Now()
 			milliseconds := tok.Sub(tik).Milliseconds()
-			if milliseconds > disableThreshold {
+			if isChannelEnabled && milliseconds > disableThreshold {
 				err = errors.New(fmt.Sprintf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0))
-				disableChannel(channel.Id, channel.Name, err.Error())
+				if config.AutomaticDisableChannelEnabled {
+					monitor.DisableChannel(channel.Id, channel.Name, err.Error())
+				} else {
+					_ = message.Notify(message.ByAll, fmt.Sprintf("渠道 %s （%d）测试超时", channel.Name, channel.Id), "", err.Error())
+				}
 			}
-			if shouldDisableChannel(openaiErr) {
-				disableChannel(channel.Id, channel.Name, err.Error())
+			if isChannelEnabled && util.ShouldDisableChannel(openaiErr, -1) {
+				monitor.DisableChannel(channel.Id, channel.Name, err.Error())
+			}
+			if !isChannelEnabled && util.ShouldEnableChannel(err, openaiErr) {
+				monitor.EnableChannel(channel.Id, channel.Name)
 			}
 			channel.UpdateResponseTime(milliseconds)
-			time.Sleep(common.RequestInterval)
+			time.Sleep(config.RequestInterval)
 		}
 		testAllChannelsLock.Lock()
 		testAllChannelsRunning = false
 		testAllChannelsLock.Unlock()
 		if notify {
-			err := common.SendEmail("通道测试完成", common.RootUserEmail, "通道测试完成，如果没有收到禁用通知，说明所有通道都正常")
+			err := message.Notify(message.ByAll, "通道测试完成", "", "通道测试完成，如果没有收到禁用通知，说明所有通道都正常")
 			if err != nil {
-				common.SysError(fmt.Sprintf("failed to send email: %s", err.Error()))
+				logger.SysError(fmt.Sprintf("failed to send email: %s", err.Error()))
 			}
 		}
 	}()
 	return nil
 }
 
-func TestAllChannels(c *gin.Context) {
-	err := testAllChannels(true)
+func TestChannels(c *gin.Context) {
+	scope := c.Query("scope")
+	if scope == "" {
+		scope = "all"
+	}
+	err := testChannels(true, scope)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -212,8 +229,8 @@ func TestAllChannels(c *gin.Context) {
 func AutomaticallyTestChannels(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Minute)
-		common.SysLog("testing all channels")
-		_ = testAllChannels(false)
-		common.SysLog("channel test finished")
+		logger.SysLog("testing all channels")
+		_ = testChannels(false, "all")
+		logger.SysLog("channel test finished")
 	}
 }

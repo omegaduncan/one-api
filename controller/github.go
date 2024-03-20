@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"github.com/songquanpeng/one-api/common"
+	"github.com/songquanpeng/one-api/common/config"
+	"github.com/songquanpeng/one-api/common/helper"
+	"github.com/songquanpeng/one-api/common/logger"
+	"github.com/songquanpeng/one-api/model"
 	"net/http"
-	"one-api/common"
-	"one-api/model"
 	"strconv"
 	"time"
 )
@@ -30,7 +33,7 @@ func getGitHubUserInfoByCode(code string) (*GitHubUser, error) {
 	if code == "" {
 		return nil, errors.New("无效的参数")
 	}
-	values := map[string]string{"client_id": common.GitHubClientId, "client_secret": common.GitHubClientSecret, "code": code}
+	values := map[string]string{"client_id": config.GitHubClientId, "client_secret": config.GitHubClientSecret, "code": code}
 	jsonData, err := json.Marshal(values)
 	if err != nil {
 		return nil, err
@@ -46,7 +49,7 @@ func getGitHubUserInfoByCode(code string) (*GitHubUser, error) {
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		common.SysLog(err.Error())
+		logger.SysLog(err.Error())
 		return nil, errors.New("无法连接至 GitHub 服务器，请稍后重试！")
 	}
 	defer res.Body.Close()
@@ -62,7 +65,7 @@ func getGitHubUserInfoByCode(code string) (*GitHubUser, error) {
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", oAuthResponse.AccessToken))
 	res2, err := client.Do(req)
 	if err != nil {
-		common.SysLog(err.Error())
+		logger.SysLog(err.Error())
 		return nil, errors.New("无法连接至 GitHub 服务器，请稍后重试！")
 	}
 	defer res2.Body.Close()
@@ -79,13 +82,21 @@ func getGitHubUserInfoByCode(code string) (*GitHubUser, error) {
 
 func GitHubOAuth(c *gin.Context) {
 	session := sessions.Default(c)
+	state := c.Query("state")
+	if state == "" || session.Get("oauth_state") == nil || state != session.Get("oauth_state").(string) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "state is empty or not same",
+		})
+		return
+	}
 	username := session.Get("username")
 	if username != nil {
 		GitHubBind(c)
 		return
 	}
 
-	if !common.GitHubOAuthEnabled {
+	if !config.GitHubOAuthEnabled {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "管理员未开启通过 GitHub 登录以及注册",
@@ -114,7 +125,7 @@ func GitHubOAuth(c *gin.Context) {
 			return
 		}
 	} else {
-		if common.RegisterEnabled {
+		if config.RegisterEnabled {
 			user.Username = "github_" + strconv.Itoa(model.GetMaxUserId()+1)
 			if githubUser.Name != "" {
 				user.DisplayName = githubUser.Name
@@ -152,7 +163,7 @@ func GitHubOAuth(c *gin.Context) {
 }
 
 func GitHubBind(c *gin.Context) {
-	if !common.GitHubOAuthEnabled {
+	if !config.GitHubOAuthEnabled {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "管理员未开启通过 GitHub 登录以及注册",
@@ -204,4 +215,23 @@ func GitHubBind(c *gin.Context) {
 		"message": "bind",
 	})
 	return
+}
+
+func GenerateOAuthCode(c *gin.Context) {
+	session := sessions.Default(c)
+	state := helper.GetRandomString(12)
+	session.Set("oauth_state", state)
+	err := session.Save()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    state,
+	})
 }
